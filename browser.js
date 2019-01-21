@@ -1,6 +1,6 @@
 'use strict';
 const electron = require('electron');
-const {is} = require('electron-util');
+const {api, is} = require('electron-util');
 const elementReady = require('element-ready');
 const config = require('./config');
 
@@ -9,24 +9,48 @@ const {ipcRenderer: ipc} = electron;
 const listSelector = 'div[role="navigation"] > div > ul';
 const conversationSelector = '._4u-c._1wfr > ._5f0v.uiScrollableArea';
 const selectedConversationSelector = '._5l-3._1ht1._1ht2';
+const preferencesSelector = '._10._4ebx.uiLayer._4-hy';
 
-function showSettingsMenu() {
-	document.querySelector('._30yy._2fug._p').click();
+async function withMenu(menuButtonElement, callback) {
+	const {classList} = document.documentElement;
+
+	// Prevent the dropdown menu from displaying
+	classList.add('hide-dropdowns');
+
+	// Click the menu button
+	menuButtonElement.click();
+
+	// Wait for the menu to close before removing the 'hide-dropdowns' class
+	const menuLayer = document.querySelector('.uiContextualLayerPositioner:not(.hidden_elem)');
+	const observer = new MutationObserver(() => {
+		if (menuLayer.classList.contains('hidden_elem')) {
+			classList.remove('hide-dropdowns');
+			observer.disconnect();
+		}
+	});
+	observer.observe(menuLayer, {attributes: true, attributeFilter: ['class']});
+
+	await callback();
+}
+
+async function withSettingsMenu(callback) {
+	await withMenu(await elementReady('._30yy._2fug._p'), callback);
 }
 
 function selectMenuItem(itemNumber) {
-	const selector = document.querySelector(`._54nq._2i-c._558b._2n_z li:nth-child(${itemNumber}) a`);
+	const selector = document.querySelector(
+		`.uiLayer:not(.hidden_elem) ._54nq._2i-c._558b._2n_z li:nth-child(${itemNumber}) a`
+	);
 	selector.click();
 }
 
-function selectOtherListViews(itemNumber) {
+async function selectOtherListViews(itemNumber) {
 	// In case one of other views is shown
 	clickBackButton();
 
-	// Create the menu for the below
-	showSettingsMenu();
-
-	selectMenuItem(itemNumber);
+	await withSettingsMenu(() => {
+		selectMenuItem(itemNumber);
+	});
 }
 
 function clickBackButton() {
@@ -45,10 +69,10 @@ ipc.on('show-preferences', async () => {
 });
 
 ipc.on('new-conversation', () => {
-	document.querySelector('._30yy[data-href$=\'/new\']').click();
+	document.querySelector("._30yy[data-href$='/new']").click();
 });
 
-ipc.on('log-out', () => {
+ipc.on('log-out', async () => {
 	if (config.get('useWorkChat')) {
 		// Create the menu for the below
 		document.querySelector('._5lxs._3qct._p').click();
@@ -58,9 +82,10 @@ ipc.on('log-out', () => {
 			nodes[nodes.length - 1].click();
 		}, 250);
 	} else {
-		showSettingsMenu();
-		const nodes = document.querySelectorAll('._54nq._2i-c._558b._2n_z li:last-child a');
-		nodes[nodes.length - 1].click();
+		await withSettingsMenu(() => {
+			const nodes = document.querySelectorAll('._54nq._2i-c._558b._2n_z li:last-child a');
+			nodes[nodes.length - 1].click();
+		});
 	}
 });
 
@@ -69,7 +94,7 @@ ipc.on('find', () => {
 });
 
 ipc.on('search', () => {
-	document.querySelector('._3szn:nth-of-type(1)').click();
+	document.querySelector('._3szo:nth-of-type(1)').click();
 });
 
 ipc.on('insert-gif', () => {
@@ -93,11 +118,18 @@ ipc.on('mute-conversation', () => {
 });
 
 ipc.on('delete-conversation', () => {
-	openDeleteModal();
+	deleteSelectedConversation();
 });
 
-ipc.on('archive-conversation', () => {
-	openArchiveModal();
+ipc.on('archive-conversation', async () => {
+	const index = selectedConversationIndex();
+
+	if (index !== -1) {
+		archiveSelectedConversation();
+
+		const key = index + 1;
+		await jumpToConversation(key);
+	}
 });
 
 function setSidebarVisibility() {
@@ -108,14 +140,25 @@ function setSidebarVisibility() {
 ipc.on('toggle-mute-notifications', async (event, defaultStatus) => {
 	const preferencesAreOpen = isPreferencesOpen();
 	if (!preferencesAreOpen) {
+		const style = document.createElement('style');
+		// Hide both the backdrop and the preferences dialog
+		style.textContent = `${preferencesSelector} ._3ixn, ${preferencesSelector} ._59s7 { opacity: 0 !important }`;
+		document.body.append(style);
+
 		await openPreferences();
+
+		// Will clean up itself after the preferences are closed
+		document.querySelector(preferencesSelector).append(style);
 	}
 
 	const notificationCheckbox = document.querySelector('._374b:nth-of-type(4) ._4ng2 input');
 
 	if (defaultStatus === undefined) {
 		notificationCheckbox.click();
-	} else if ((defaultStatus && notificationCheckbox.checked) || (!defaultStatus && !notificationCheckbox.checked)) {
+	} else if (
+		(defaultStatus && notificationCheckbox.checked) ||
+		(!defaultStatus && !notificationCheckbox.checked)
+	) {
 		notificationCheckbox.click();
 	}
 
@@ -148,12 +191,30 @@ ipc.on('toggle-unread-threads-view', () => {
 });
 
 function setDarkMode() {
-	document.documentElement.classList.toggle('dark-mode', config.get('darkMode'));
-	ipc.send('set-vibrancy');
+	if (is.macos && config.get('followSystemAppearance')) {
+		document.documentElement.classList.toggle('dark-mode', api.systemPreferences.isDarkMode());
+	} else {
+		document.documentElement.classList.toggle('dark-mode', config.get('darkMode'));
+	}
+
+	updateVibrancy();
 }
 
-function setVibrancy() {
-	document.documentElement.classList.toggle('vibrancy', config.get('vibrancy'));
+function updateVibrancy() {
+	const {classList} = document.documentElement;
+
+	classList.remove('sidebar-vibrancy', 'full-vibrancy');
+
+	switch (config.get('vibrancy')) {
+		case 'sidebar':
+			classList.add('sidebar-vibrancy');
+			break;
+		case 'full':
+			classList.add('full-vibrancy');
+			break;
+		default:
+	}
+
 	ipc.send('set-vibrancy');
 }
 
@@ -181,15 +242,16 @@ ipc.on('toggle-sidebar', () => {
 
 ipc.on('set-dark-mode', setDarkMode);
 
-ipc.on('toggle-vibrancy', () => {
-	config.set('vibrancy', !config.get('vibrancy'));
-	setVibrancy();
-
-	document.documentElement.style.backgroundColor = 'transparent';
+ipc.on('update-vibrancy', () => {
+	updateVibrancy();
 });
 
 ipc.on('render-overlay-icon', (event, messageCount) => {
-	ipc.send('update-overlay-icon', renderOverlayIcon(messageCount).toDataURL(), String(messageCount));
+	ipc.send(
+		'update-overlay-icon',
+		renderOverlayIcon(messageCount).toDataURL(),
+		String(messageCount)
+	);
 });
 
 ipc.on('zoom-reset', () => {
@@ -212,105 +274,99 @@ ipc.on('zoom-out', () => {
 	}
 });
 
-ipc.on('jump-to-conversation', (event, index) => {
-	jumpToConversation(index);
+ipc.on('jump-to-conversation', async (event, key) => {
+	await jumpToConversation(key);
 });
 
-function nextConversation() {
-	const index = getNextIndex(true);
-	selectConversation(index);
+async function nextConversation() {
+	const index = selectedConversationIndex(1);
+
+	if (index !== -1) {
+		await selectConversation(index);
+	}
 }
 
-function previousConversation() {
-	const index = getNextIndex(false);
-	selectConversation(index);
+async function previousConversation() {
+	const index = selectedConversationIndex(-1);
+
+	if (index !== -1) {
+		await selectConversation(index);
+	}
 }
 
-function jumpToConversation(key) {
+async function jumpToConversation(key) {
 	const index = key - 1;
-	selectConversation(index);
+	await selectConversation(index);
 }
 
 // Focus on the conversation with the given index
-function selectConversation(index) {
-	document.querySelector(listSelector).children[index].firstChild.firstChild.click();
+async function selectConversation(index) {
+	const conversationElement = (await elementReady(listSelector)).children[index];
+
+	if (conversationElement) {
+		conversationElement.firstChild.firstChild.click();
+	}
 }
 
-// Returns the index of the selected conversation.
-// If no conversation is selected, returns null.
-function getIndex() {
+function selectedConversationIndex(offset = 0) {
 	const selected = document.querySelector(selectedConversationSelector);
+
 	if (!selected) {
-		return null;
+		return -1;
 	}
 
 	const list = [...selected.parentNode.children];
-
-	return list.indexOf(selected);
-}
-
-// Return the index for next node if next is true,
-// else returns index for the previous node
-function getNextIndex(next) {
-	const selected = document.querySelector(selectedConversationSelector);
-	if (!selected) {
-		return 0;
-	}
-
-	const list = [...selected.parentNode.children];
-	const index = list.indexOf(selected) + (next ? 1 : -1);
+	const index = list.indexOf(selected) + offset;
 
 	return ((index % list.length) + list.length) % list.length;
 }
 
 function setZoom(zoomFactor) {
-	const node = document.getElementById('zoomFactor');
+	const node = document.querySelector('#zoomFactor');
 	node.textContent = `${conversationSelector} {zoom: ${zoomFactor} !important}`;
 	config.set('zoomFactor', zoomFactor);
 }
 
-function openConversationMenu() {
-	const index = getIndex();
-	if (index === null) {
-		return false;
+async function withConversationMenu(callback) {
+	const menuButton = document.querySelector(`${selectedConversationSelector} ._5blh._4-0h`);
+
+	if (menuButton) {
+		await withMenu(menuButton, callback);
 	}
-
-	// Open and close the menu for the below
-	const menu = document.querySelectorAll('._2j6._5l-3 ._3d85')[index].firstChild;
-	menu.click();
-
-	return true;
 }
 
 function openMuteModal() {
-	if (!openConversationMenu()) {
-		return;
-	}
-
-	selectMenuItem(1);
+	withConversationMenu(() => {
+		selectMenuItem(1);
+	});
 }
 
-function openArchiveModal() {
-	if (!openConversationMenu()) {
-		return;
-	}
+function archiveSelectedConversation() {
+	const groupConversationProfilePicture = document.querySelector(
+		`${selectedConversationSelector} ._55lu`
+	);
+	const isGroupConversation = Boolean(groupConversationProfilePicture);
 
-	selectMenuItem(3);
+	withConversationMenu(() => {
+		selectMenuItem(isGroupConversation ? 4 : 3);
+	});
 }
 
-function openDeleteModal() {
-	if (!openConversationMenu()) {
-		return;
-	}
+function deleteSelectedConversation() {
+	const groupConversationProfilePicture = document.querySelector(
+		`${selectedConversationSelector} ._55lu`
+	);
+	const isGroupConversation = Boolean(groupConversationProfilePicture);
 
-	selectMenuItem(4);
+	withConversationMenu(() => {
+		selectMenuItem(isGroupConversation ? 5 : 4);
+	});
 }
 
 async function openPreferences() {
-	// Create the menu for the below
-	(await elementReady('._30yy._2fug._p')).click();
-
-	selectMenuItem(1);
+	await withSettingsMenu(() => {
+		selectMenuItem(1);
+	});
 }
 
 function isPreferencesOpen() {
@@ -321,32 +377,34 @@ function closePreferences() {
 	const doneButton = document.querySelector('._3quh._30yy._2t_._5ixy');
 	doneButton.click();
 }
+
 async function sendConversationList() {
-	const sidebar = document.querySelector('[role=navigation]');
-
 	const conversations = await Promise.all(
-		[...sidebar.querySelectorAll('._1ht1')]
-			.splice(0, 10)
-			.map(async el => {
-				const profilePic = el.querySelector('._55lt img');
-				const groupPic = el.querySelector('._4ld- div');
+		[...(await elementReady(listSelector)).children].splice(0, 10).map(async el => {
+			const profilePic = el.querySelector('._55lt img');
+			const groupPic = el.querySelector('._4ld- div');
 
-				// This is only for group chats
-				if (groupPic) {
-					// Slice image soruce from background-image style property of div
-					groupPic.src = groupPic.style.backgroundImage.slice(5, groupPic.style.backgroundImage.length - 2);
-				}
+			// This is only for group chats
+			if (groupPic) {
+				// Slice image source from background-image style property of div
+				groupPic.src = groupPic.style.backgroundImage.slice(
+					5,
+					groupPic.style.backgroundImage.length - 2
+				);
+			}
 
-				return {
-					label: el.querySelector('._1ht6').textContent,
-					selected: el.classList.contains('_1ht2'),
-					unread: el.classList.contains('_1ht3'),
-					icon: await getDataUrlFromImg(
-						profilePic ? profilePic : groupPic,
-						el.classList.contains('_1ht3')
-					)
-				};
-			})
+			const isConversationMuted = el.classList.contains('_569x');
+
+			return {
+				label: el.querySelector('._1ht6').textContent,
+				selected: el.classList.contains('_1ht2'),
+				unread: el.classList.contains('_1ht3') && !isConversationMuted,
+				icon: await getDataUrlFromImg(
+					profilePic ? profilePic : groupPic,
+					el.classList.contains('_1ht3')
+				)
+			};
+		})
 	);
 
 	ipc.send('conversations', conversations);
@@ -373,7 +431,7 @@ function urlToCanvas(url, size) {
 
 			ctx.save();
 			ctx.beginPath();
-			ctx.arc((size / 2) + padding.left, (size / 2) + padding.top, size / 2, 0, Math.PI * 2, true);
+			ctx.arc(size / 2 + padding.left, size / 2 + padding.top, size / 2, 0, Math.PI * 2, true);
 			ctx.closePath();
 			ctx.clip();
 
@@ -421,10 +479,10 @@ function getDataUrlFromImg(img, unread) {
 document.addEventListener('DOMContentLoaded', () => {
 	const style = document.createElement('style');
 	style.id = 'zoomFactor';
-	document.body.appendChild(style);
+	document.body.append(style);
 
 	// Set the zoom factor if it was set before quitting
-	const zoomFactor = config.get('zoomFactor') || 1.0;
+	const zoomFactor = config.get('zoomFactor') || 1;
 	setZoom(zoomFactor);
 
 	// Enable OS specific styles
@@ -438,12 +496,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
 	// Prevent flash of white on startup when in dark mode
 	// TODO: find a CSS-only solution
-	if (config.get('darkMode') && !config.get('vibrancy')) {
+	if (!is.macos && config.get('darkMode')) {
 		document.documentElement.style.backgroundColor = '#1e1e1e';
 	}
-
-	// Activate vibrancy effect if it was set before quitting
-	setVibrancy();
 });
 
 window.addEventListener('load', () => {
@@ -463,70 +518,72 @@ window.addEventListener('load', () => {
 
 	if (location.pathname.startsWith('/login')) {
 		const keepMeSignedInCheckbox = document.querySelector('#u_0_0');
-		keepMeSignedInCheckbox.checked = true;
+		keepMeSignedInCheckbox.checked = config.get('keepMeSignedIn');
+		keepMeSignedInCheckbox.addEventListener('click', () => {
+			config.set('keepMeSignedIn', !config.get('keepMeSignedIn'));
+		});
 	}
 });
 
 // It's not possible to add multiple accelerators
 // so this needs to be done the old-school way
-document.addEventListener('keydown', event => {
+document.addEventListener('keydown', async event => {
 	// The `!event.altKey` part is a workaround for https://github.com/electron/electron/issues/13895
-	const combineKey = is.macos ? event.metaKey : (event.ctrlKey && !event.altKey);
+	const combineKey = is.macos ? event.metaKey : event.ctrlKey && !event.altKey;
 
 	if (!combineKey) {
 		return;
 	}
 
 	if (event.key === ']') {
-		nextConversation();
+		await nextConversation();
 	}
 
 	if (event.key === '[') {
-		previousConversation();
+		await previousConversation();
 	}
 
 	const num = parseInt(event.code.slice(-1), 10);
 
 	if (num >= 1 && num <= 9) {
-		jumpToConversation(num);
+		await jumpToConversation(num);
 	}
 });
 
-window.Notification = (notification => {
-	const customNotification = function (title, options) {
-		let {body, icon, silent} = options;
-		body = body.props ? body.props.content[0] : body;
-		title = (typeof title === 'object' && title.props) ? title.props.content[0] : title;
-
-		const img = new Image();
-		img.crossOrigin = 'anonymous';
-		img.src = icon;
-
-		img.addEventListener('load', () => {
-			const canvas = document.createElement('canvas');
-			const ctx = canvas.getContext('2d');
-
-			canvas.width = img.width;
-			canvas.height = img.height;
-
-			ctx.drawImage(img, 0, 0, img.width, img.height);
-
-			const fileName = icon.substring(icon.lastIndexOf('/') + 1, icon.indexOf('?'));
-
-			ipc.send('notification', {title, body, icon: canvas.toDataURL(), silent, fileName});
-		});
-
-		return false;
-	};
-
-	return Object.assign(customNotification, notification);
-})(window.Notification);
-
-ipc.on('jump-to-conversation-by-img', (event, fileName) => {
-	selectConversationByImg(fileName);
+// Pass events sent via `window.postMessage` on to the main process
+window.addEventListener('message', ({data: {type, data}}) => {
+	if (type === 'notification') {
+		showNotification(data);
+	}
 });
 
-function selectConversationByImg(fileName) {
-	const selector = `${listSelector} img[src*="${fileName}"]`;
-	document.querySelector(selector).click();
+function showNotification({id, title, body, icon, silent}) {
+	body = body.props ? body.props.content[0] : body;
+	title = typeof title === 'object' && title.props ? title.props.content[0] : title;
+
+	const img = new Image();
+	img.crossOrigin = 'anonymous';
+	img.src = icon;
+
+	img.addEventListener('load', () => {
+		const canvas = document.createElement('canvas');
+		const ctx = canvas.getContext('2d');
+
+		canvas.width = img.width;
+		canvas.height = img.height;
+
+		ctx.drawImage(img, 0, 0, img.width, img.height);
+
+		ipc.send('notification', {
+			id,
+			title,
+			body,
+			icon: canvas.toDataURL(),
+			silent
+		});
+	});
 }
+
+ipc.on('notification-callback', (event, data) => {
+	window.postMessage({type: 'notification-callback', data}, '*');
+});

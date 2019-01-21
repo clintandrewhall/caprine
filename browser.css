@@ -1,3 +1,7 @@
+:root {
+	--selected-conversation-background: linear-gradient(hsla(209, 110%, 45%, 0.9), hsla(209, 110%, 42%, 0.9));
+}
+
 html {
 	overflow: hidden;
 }
@@ -46,6 +50,11 @@ body {
 	-webkit-user-drag: none;
 }
 
+/* Vertically align `Conversation Info` buttons */
+._fl2 ._30yy {
+	vertical-align: middle;
+}
+
 /* Window wrapper */
 ._4sp8 {
 	min-width: 0 !important;
@@ -59,6 +68,11 @@ body {
 /* Hide sidebar (optionally) */
 html.sidebar-hidden ._1enh {
 	display: none;
+}
+
+/* A utility class for temporarily hiding all dropdown menus */
+html.hide-dropdowns .uiContextualLayerPositioner {
+	visibility: hidden !important;
 }
 
 /* Hide footer at login view */
@@ -81,14 +95,9 @@ html.sidebar-hidden ._1enh {
 	border-left: 1px solid rgba(0, 0, 0, 0.1) !important;
 }
 
-/* Hide settings menu */
-.uiContextualLayerBelowLeft ._5v-0._53il {
-	display: none !important;
-}
-
 /* Hide settings icon */
 ._30yy._2fug._p {
-	display: none !important;
+	visibility: hidden !important;
 }
 
 /* Hide title */
@@ -358,4 +367,35 @@ a,
 .__6j._43kk {
 	border-width: 1px !important;
 	border-color: rgba(0, 0, 0, 0.1) !important;
+}
+
+/* Contact list: unread */
+._1ht1 a,
+._1ht3 a {
+	padding-left: 14px !important;
+}
+._1ht3::before {
+	content: ' ';
+	display: block;
+	position: absolute;
+	left: 3px;
+	top: 50%;
+	transform: translateY(-50%);
+	width: 8px;
+	height: 8px;
+	background-color: var(--blue);
+	border-radius: 8px;
+}
+
+/* Contact list: person (selected) */
+._1ht1._1ht2 {
+	background: var(--selected-conversation-background) !important;
+}
+._1ht1._1ht2 * {
+	color: rgba(255, 255, 255, 0.8);
+}
+
+/* Remove top Facebook cookie banner */
+.fbPageBanner {
+	display: none !important;
 }

@@ -1,16 +1,16 @@
 'use strict';
 const path = require('path');
 const fs = require('fs');
-const {URL} = require('url');
 const electron = require('electron');
-const {is} = require('electron-util');
+const {darkMode, is} = require('electron-util');
 const log = require('electron-log');
 const {autoUpdater} = require('electron-updater');
 const isDev = require('electron-is-dev');
-const appMenu = require('./menu');
+const updateAppMenu = require('./menu');
 const config = require('./config');
 const tray = require('./tray');
 const {sendAction} = require('./util');
+const emoji = require('./emoji');
 
 require('./touch-bar'); // eslint-disable-line import/no-unassigned-import
 
@@ -22,9 +22,14 @@ require('electron-dl')();
 require('electron-context-menu')();
 
 const domain = config.get('useWorkChat') ? 'facebook.com' : 'messenger.com';
-const {app, ipcMain, Menu, nativeImage, Notification} = electron;
+const {app, ipcMain, Menu, nativeImage, Notification, systemPreferences} = electron;
 
 app.setAppUserModelId('com.sindresorhus.caprine');
+
+// Disables broken color space correction in Chromium.
+// You can see differing background color on the login screen.
+// https://github.com/electron/electron/issues/9671
+app.commandLine.appendSwitch('disable-color-correct-rendering');
 
 if (!config.get('hardwareAcceleration')) {
 	app.disableHardwareAcceleration();
@@ -58,7 +63,7 @@ app.on('second-instance', () => {
 });
 
 function updateBadge(conversations) {
-	// ignore `Sindre messaged you` blinking
+	// Ignore `Sindre messaged you` blinking
 	if (!Array.isArray(conversations)) {
 		return;
 	}
@@ -69,14 +74,21 @@ function updateBadge(conversations) {
 		if (config.get('showUnreadBadge')) {
 			app.setBadgeCount(messageCount);
 		}
+
 		if (is.macos && config.get('bounceDockOnMessage') && prevMessageCount !== messageCount) {
 			app.dock.bounce('informational');
 			prevMessageCount = messageCount;
 		}
 	}
 
-	if ((is.linux || is.windows) && config.get('showUnreadBadge')) {
-		tray.setBadge(messageCount);
+	if (is.linux || is.windows) {
+		if (config.get('showUnreadBadge')) {
+			tray.setBadge(messageCount);
+		}
+
+		if (config.get('flashWindowOnMessage')) {
+			mainWindow.flashFrame(messageCount !== 0);
+		}
 	}
 
 	if (is.windows) {
@@ -87,10 +99,6 @@ function updateBadge(conversations) {
 				// Delegate drawing of overlay icon to renderer process
 				mainWindow.webContents.send('render-overlay-icon', messageCount);
 			}
-		}
-
-		if (config.get('flashWindowOnMessage')) {
-			mainWindow.flashFrame(messageCount !== 0);
 		}
 	}
 }
@@ -127,17 +135,24 @@ function enableHiresResources() {
 	});
 }
 
-function setUpPrivacyBlocking() {
-	const ses = electron.session.defaultSession;
-	const filter = {urls: [`*://*.${domain}/*typ.php*`, `*://*.${domain}/*change_read_status.php*`]};
-	ses.webRequest.onBeforeRequest(filter, (details, callback) => {
-		let blocking = false;
-		if (details.url.includes('typ.php')) {
-			blocking = config.get('block.typingIndicator');
-		} else {
-			blocking = config.get('block.chatSeen');
+function initRequestsFiltering() {
+	const filter = {
+		urls: [
+			`*://*.${domain}/*typ.php*`, // Type indicator blocker
+			`*://*.${domain}/*change_read_status.php*`, // Seen indicator blocker
+			'*://static.xx.fbcdn.net/images/emoji.php/v9/*', // Emoji
+			'*://facebook.com/images/emoji.php/v9/*' // Emoji
+		]
+	};
+
+	electron.session.defaultSession.webRequest.onBeforeRequest(filter, ({url}, callback) => {
+		if (url.includes('emoji.php')) {
+			callback(emoji.process(url));
+		} else if (url.includes('typ.php')) {
+			callback({cancel: config.get('block.typingIndicator')});
+		} else if (url.includes('change_read_status.php')) {
+			callback({cancel: config.get('block.chatSeen')});
 		}
-		callback({cancel: blocking});
 	});
 }
 
@@ -170,7 +185,9 @@ function createMainWindow() {
 	const isDarkMode = config.get('darkMode');
 
 	// Messenger or Work Chat
-	const mainURL = config.get('useWorkChat') ? 'https://work.facebook.com/chat' : 'https://www.messenger.com/login/';
+	const mainURL = config.get('useWorkChat')
+		? 'https://work.facebook.com/chat'
+		: 'https://www.messenger.com/login/';
 
 	const win = new electron.BrowserWindow({
 		title: app.getName(),
@@ -189,12 +206,17 @@ function createMainWindow() {
 		webPreferences: {
 			preload: path.join(__dirname, 'browser.js'),
 			nodeIntegration: false,
+			contextIsolation: true,
 			plugins: true
 		}
 	});
 
 	setUserLocale();
-	setUpPrivacyBlocking();
+	initRequestsFiltering();
+
+	darkMode.onChange(() => {
+		win.webContents.send('set-dark-mode');
+	});
 
 	if (is.macos) {
 		win.setSheetOffset(40);
@@ -231,7 +253,8 @@ function createMainWindow() {
 	await app.whenReady();
 
 	const trackingUrlPrefix = `https://l.${domain}/l.php`;
-	electron.Menu.setApplicationMenu(appMenu);
+
+	updateAppMenu();
 	mainWindow = createMainWindow();
 	tray.create(mainWindow);
 
@@ -265,6 +288,7 @@ function createMainWindow() {
 			app.dock.setMenu(electron.Menu.buildFromTemplate([firstItem, {type: 'separator'}, ...items]));
 		});
 	}
+
 	// Update badge on conversations change
 	ipcMain.on('conversations', (event, conversations) => updateBadge(conversations));
 
@@ -276,8 +300,15 @@ function createMainWindow() {
 		webContents.insertCSS(fs.readFileSync(path.join(__dirname, 'browser.css'), 'utf8'));
 		webContents.insertCSS(fs.readFileSync(path.join(__dirname, 'dark-mode.css'), 'utf8'));
 		webContents.insertCSS(fs.readFileSync(path.join(__dirname, 'vibrancy.css'), 'utf8'));
+
 		if (config.get('useWorkChat')) {
 			webContents.insertCSS(fs.readFileSync(path.join(__dirname, 'workchat.css'), 'utf8'));
+		}
+
+		if (fs.existsSync(path.join(app.getPath('userData'), 'custom.css'))) {
+			webContents.insertCSS(
+				fs.readFileSync(path.join(app.getPath('userData'), 'custom.css'), 'utf8')
+			);
 		}
 
 		if (config.get('launchMinimized') || app.getLoginItemSettings().wasOpenedAsHidden) {
@@ -286,15 +317,20 @@ function createMainWindow() {
 			mainWindow.show();
 		}
 
-		mainWindow.webContents.send('toggle-mute-notifications', config.get('notificationsMuted'));
-		mainWindow.webContents.send('toggle-message-buttons', config.get('showMessageButtons'));
+		webContents.send('toggle-mute-notifications', config.get('notificationsMuted'));
+		webContents.send('toggle-message-buttons', config.get('showMessageButtons'));
+
+		webContents.executeJavaScript(
+			fs.readFileSync(path.join(__dirname, 'notifications-isolated.js'), 'utf8')
+		);
 	});
 
 	webContents.on('new-window', (event, url, frameName, disposition, options) => {
 		event.preventDefault();
 
 		if (url === 'about:blank') {
-			if (frameName !== 'about:blank') { // Voice/video call popup
+			if (frameName !== 'about:blank') {
+				// Voice/video call popup
 				options.show = true;
 				options.titleBarStyle = 'default';
 				options.webPreferences.nodeIntegration = false;
@@ -343,11 +379,7 @@ function createMainWindow() {
 			return false;
 		};
 
-		if (
-			isMessengerDotCom(url) ||
-			isTwoFactorAuth(url) ||
-			isWorkChat(url)
-		) {
+		if (isMessengerDotCom(url) || isTwoFactorAuth(url) || isWorkChat(url)) {
 			return;
 		}
 
@@ -356,13 +388,17 @@ function createMainWindow() {
 	});
 })();
 
-ipcMain.on('set-vibrancy', () => {
-	if (config.get('vibrancy')) {
-		mainWindow.setVibrancy(config.get('darkMode') ? 'ultra-dark' : 'light');
-	} else {
-		mainWindow.setVibrancy(null);
-	}
-});
+if (is.macos) {
+	ipcMain.on('set-vibrancy', () => {
+		mainWindow.setVibrancy('sidebar');
+
+		if (config.get('followSystemAppearance')) {
+			systemPreferences.setAppLevelAppearance(systemPreferences.isDarkMode() ? 'dark' : 'light');
+		} else {
+			systemPreferences.setAppLevelAppearance(config.get('darkMode') ? 'dark' : 'light');
+		}
+	});
+}
 
 ipcMain.on('mute-notifications-toggled', (event, status) => {
 	setNotificationsMute(status);
@@ -374,13 +410,10 @@ app.on('activate', () => {
 
 app.on('before-quit', () => {
 	isQuitting = true;
-
-	if (!mainWindow.isFullScreen()) {
-		config.set('lastWindowState', mainWindow.getBounds());
-	}
+	config.set('lastWindowState', mainWindow.getNormalBounds());
 });
 
-ipcMain.on('notification', (event, {title, body, icon, silent, fileName}) => {
+ipcMain.on('notification', (event, {id, title, body, icon, silent}) => {
 	const notification = new Notification({
 		title,
 		body,
@@ -388,9 +421,15 @@ ipcMain.on('notification', (event, {title, body, icon, silent, fileName}) => {
 		silent,
 		sound: path.join(__dirname, 'static/notification.mp3')
 	});
-	notification.show();
+
 	notification.on('click', () => {
 		mainWindow.show();
-		sendAction('jump-to-conversation-by-img', fileName);
+		sendAction('notification-callback', {callbackName: 'onclick', id});
 	});
+
+	notification.on('close', () => {
+		sendAction('notification-callback', {callbackName: 'onclose', id});
+	});
+
+	notification.show();
 });
